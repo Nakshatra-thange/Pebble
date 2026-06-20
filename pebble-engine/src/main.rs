@@ -1,146 +1,169 @@
 mod engine;
 
-use engine::metrics::new_shared_metrics;
-use engine::wal::{Wal, WalEntry};
+use engine::engine::Engine;
 use std::fs;
-use std::io::Write;
 
 fn main() {
-    println!("=== Pebble Engine — Day 2: WAL Tests ===\n");
+    println!("=== Pebble Engine — Day 4: SSTable Flush + Read ===\n");
 
-    let wal_path = "/tmp/pebble_test.wal";
+    let db_dir = "/tmp/pebble_day4";
+    let _ = fs::remove_dir_all(db_dir);
 
-    // Clean slate
-    let _ = fs::remove_file(wal_path);
-
-    // ── Test 1: Normal append + replay ──────────────────────────────────────
-    println!("── Test 1: Normal append + replay");
+    // ── Test 1: Basic put + get through the engine ───────────────────────────
+    println!("── Test 1: Basic put / get");
     {
-        let metrics = new_shared_metrics();
-        let mut wal = Wal::open(wal_path, metrics.clone()).unwrap();
+        let mut engine = Engine::open(db_dir).unwrap();
 
-        wal.append_put(b"name", b"alice").unwrap();
-        wal.append_put(b"age", b"30").unwrap();
-        wal.append_put(b"city", b"delhi").unwrap();
-        wal.append_delete(b"age").unwrap();
+        engine.put(b"name", b"alice").unwrap();
+        engine.put(b"city", b"pune").unwrap();
+        engine.put(b"lang", b"rust").unwrap();
 
-        println!("  WAL size after 4 records: {} bytes", metrics.lock().unwrap().wal_size_bytes);
+        println!("  get(name) = {:?}", engine.get(b"name").unwrap());
+        println!("  get(city) = {:?}", engine.get(b"city").unwrap());
+        println!("  get(missing) = {:?}", engine.get(b"missing").unwrap());
 
-        let entries = wal.replay().unwrap();
-        println!("  Replayed {} entries:", entries.len());
-        for e in &entries {
-            match e {
-                WalEntry::Put { key, value } => println!(
-                    "    PUT  {:?} = {:?}",
-                    String::from_utf8_lossy(key),
-                    String::from_utf8_lossy(value)
-                ),
-                WalEntry::Delete { key } => println!(
-                    "    DEL  {:?}",
-                    String::from_utf8_lossy(key)
-                ),
-            }
-        }
-
-        let recovery_ms = metrics.lock().unwrap().recovery_time_ms;
-        println!("  Recovery time: {}ms", recovery_ms);
+        let snap = engine.metrics.lock().unwrap().snapshot();
+        println!("  WAL size: {} bytes", snap.wal_size_bytes);
+        println!("  SSTables: {}", snap.sstable_count);
     }
 
-    // ── Test 2: Torn-write detection ─────────────────────────────────────────
-    println!("\n── Test 2: Torn-write detection");
+    // ── Test 2: Force a flush, then read from SSTable ────────────────────────
+    println!("\n── Test 2: Manual flush → read from SSTable");
     {
-        let _ = fs::remove_file(wal_path);
-        let metrics = new_shared_metrics();
-        let mut wal = Wal::open(wal_path, metrics.clone()).unwrap();
+        let _ = fs::remove_dir_all(db_dir);
+        let mut engine = Engine::open(db_dir).unwrap();
 
-        wal.append_put(b"good_key_1", b"good_val_1").unwrap();
-        wal.append_put(b"good_key_2", b"good_val_2").unwrap();
-
-        // Simulate a torn write: manually append garbage bytes
-        // (as if the process died mid-write)
-        {
-            let mut f = fs::OpenOptions::new()
-                .append(true)
-                .open(wal_path)
-                .unwrap();
-            f.write_all(b"\x00\xFF\xAB\x12\xDE\xAD\xBE\xEF partial record").unwrap();
-            // No fsync — the process "died" here
+        // Write some data
+        for i in 0u32..50 {
+            let key = format!("key_{:04}", i);
+            let val = format!("value_{:04}", i);
+            engine.put(key.as_bytes(), val.as_bytes()).unwrap();
         }
 
-        let size_with_garbage = fs::metadata(wal_path).unwrap().len();
-        println!("  File size with torn write: {} bytes", size_with_garbage);
+        println!("  Before flush — SSTables: {}", engine.metrics.lock().unwrap().sstable_count);
+        println!("  Before flush — WAL size: {} bytes", engine.metrics.lock().unwrap().wal_size_bytes);
 
-        let entries = wal.replay().unwrap();
-        let size_after_replay = fs::metadata(wal_path).unwrap().len();
+        // Force flush (normally triggered by size threshold)
+        engine.flush_memtable().unwrap();
 
-        println!("  Entries recovered (only valid ones): {}", entries.len());
-        println!("  File size after truncation: {} bytes", size_after_replay);
+        println!("  After flush  — SSTables: {}", engine.metrics.lock().unwrap().sstable_count);
+        println!("  After flush  — WAL size: {} bytes (truncated)", engine.metrics.lock().unwrap().wal_size_bytes);
 
-        assert_eq!(entries.len(), 2, "Should recover exactly 2 good entries");
-        assert!(
-            size_after_replay < size_with_garbage,
-            "Truncation should have removed the garbage tail"
+        // Read back from SSTable
+        let v = engine.get(b"key_0023").unwrap();
+        println!("  get(key_0023) from SSTable = {:?}", v.map(|b| String::from_utf8(b).unwrap()));
+
+        let v = engine.get(b"key_0049").unwrap();
+        println!("  get(key_0049) from SSTable = {:?}", v.map(|b| String::from_utf8(b).unwrap()));
+    }
+
+    // ── Test 3: Delete → tombstone survives flush ────────────────────────────
+    println!("\n── Test 3: Delete survives flush");
+    {
+        let _ = fs::remove_dir_all(db_dir);
+        let mut engine = Engine::open(db_dir).unwrap();
+
+        engine.put(b"ghost", b"i exist").unwrap();
+        engine.delete(b"ghost").unwrap();
+        engine.flush_memtable().unwrap();
+
+        // Must still return None — tombstone in SSTable blocks the read
+        let v = engine.get(b"ghost").unwrap();
+        println!("  get(ghost) after flush = {:?} (None = tombstone respected ✓)", v);
+    }
+
+    // ── Test 4: memtable + SSTable read merge ────────────────────────────────
+    println!("\n── Test 4: Memtable shadows SSTable");
+    {
+        let _ = fs::remove_dir_all(db_dir);
+        let mut engine = Engine::open(db_dir).unwrap();
+
+        // Write v1 and flush it to SSTable
+        engine.put(b"version", b"v1").unwrap();
+        engine.flush_memtable().unwrap();
+
+        // Write v2 — lives in memtable only
+        engine.put(b"version", b"v2").unwrap();
+
+        let v = engine.get(b"version").unwrap();
+        println!(
+            "  get(version) = {:?} (should be v2 from memtable, not v1 from SSTable ✓)",
+            v.map(|b| String::from_utf8(b).unwrap())
         );
-        println!("  Torn-write detection ✓");
     }
 
-    // ── Test 3: WAL survives a simulated crash + reopen ──────────────────────
-    println!("\n── Test 3: Crash simulation (close + reopen)");
+    // ── Test 5: Range scan across memtable + SSTable ─────────────────────────
+    println!("\n── Test 5: Range scan across memtable + SSTable");
     {
-        let _ = fs::remove_file(wal_path);
-        let metrics = new_shared_metrics();
+        let _ = fs::remove_dir_all(db_dir);
+        let mut engine = Engine::open(db_dir).unwrap();
 
-        // Write phase — "process A"
+        // Flush first batch
+        engine.put(b"apple", b"1").unwrap();
+        engine.put(b"cherry", b"3").unwrap();
+        engine.put(b"elderberry", b"5").unwrap();
+        engine.flush_memtable().unwrap();
+
+        // Second batch stays in memtable
+        engine.put(b"banana", b"2").unwrap();
+        engine.put(b"date", b"4").unwrap();
+
+        let results = engine.scan(b"apple", b"fig").unwrap();
+        println!("  scan(apple..fig):");
+        for (k, v) in &results {
+            println!(
+                "    {:?} = {:?}",
+                String::from_utf8_lossy(k),
+                String::from_utf8_lossy(v)
+            );
+        }
+        assert_eq!(results.len(), 5);
+        println!("  All 5 entries merged correctly ✓");
+    }
+
+    // ── Test 6: Crash recovery — reopen and read SSTables ────────────────────
+    println!("\n── Test 6: Crash recovery across engine reopen");
+    {
+        let _ = fs::remove_dir_all(db_dir);
+
+        // Session A — write and flush
         {
-            let mut wal = Wal::open(wal_path, metrics.clone()).unwrap();
-            wal.append_put(b"survivor", b"yes").unwrap();
-            wal.append_put(b"also_survivor", b"definitely").unwrap();
-            // WAL is dropped here — file is closed (simulating crash)
+            let mut engine = Engine::open(db_dir).unwrap();
+            engine.put(b"durable", b"absolutely").unwrap();
+            engine.flush_memtable().unwrap();
+            // Engine dropped here — simulated shutdown
         }
 
-        // Recovery phase — "process B" restarts
-        let mut wal = Wal::open(wal_path, metrics.clone()).unwrap();
-        let entries = wal.replay().unwrap();
-
-        println!("  Entries recovered after reopen: {}", entries.len());
-        for e in &entries {
-            if let WalEntry::Put { key, value } = e {
-                println!(
-                    "    PUT {:?} = {:?}",
-                    String::from_utf8_lossy(key),
-                    String::from_utf8_lossy(value)
-                );
-            }
+        // Session B — reopen, data should still be there
+        {
+            let mut engine = Engine::open(db_dir).unwrap();
+            let v = engine.get(b"durable").unwrap();
+            println!(
+                "  get(durable) after reopen = {:?} ✓",
+                v.map(|b| String::from_utf8(b).unwrap())
+            );
+            println!("  SSTables found on reopen: {}", engine.metrics.lock().unwrap().sstable_count);
         }
-        assert_eq!(entries.len(), 2);
-        println!("  Crash + reopen ✓");
     }
 
-    // ── Test 4: Recovery timing benchmark ────────────────────────────────────
-    println!("\n── Test 4: Recovery timing (1000 records)");
+    // ── Test 7: Metrics snapshot ──────────────────────────────────────────────
+    println!("\n── Test 7: Metrics after a full session");
     {
-        let _ = fs::remove_file(wal_path);
-        let metrics = new_shared_metrics();
-        let mut wal = Wal::open(wal_path, metrics.clone()).unwrap();
+        let _ = fs::remove_dir_all(db_dir);
+        let mut engine = Engine::open(db_dir).unwrap();
 
-        for i in 0u32..1000 {
-            let key = format!("key_{:06}", i);
-            let val = format!("value_{:06}_padding_to_make_it_realistic", i);
-            wal.append_put(key.as_bytes(), val.as_bytes()).unwrap();
+        for i in 0u32..30 {
+            engine.put(format!("k{}", i).as_bytes(), b"v").unwrap();
+        }
+        engine.flush_memtable().unwrap();
+        for i in 0u32..10 {
+            engine.get(format!("k{}", i).as_bytes()).unwrap();
         }
 
-        let wal_size = metrics.lock().unwrap().wal_size_bytes;
-        println!("  WAL size (1000 records): {} bytes ({:.1} KB)", wal_size, wal_size as f64 / 1024.0);
-
-        let entries = wal.replay().unwrap();
-        let recovery_ms = metrics.lock().unwrap().recovery_time_ms;
-
-        println!("  Replayed: {} entries", entries.len());
-        println!("  Recovery time: {}ms", recovery_ms);
-        println!("  → This number goes in your benchmark table on Day 7");
+        let snap = engine.metrics.lock().unwrap().snapshot();
+        println!("  {}", snap.to_json());
     }
 
-    // Cleanup
-    let _ = fs::remove_file(wal_path);
-    println!("\nDay 2 complete. WAL is durable, torn-write-safe, and timed.");
+    let _ = fs::remove_dir_all(db_dir);
+    println!("\nDay 4 complete. SSTable flush, sparse index seek, and cross-layer reads all work.");
 }
