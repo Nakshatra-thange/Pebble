@@ -117,20 +117,41 @@ impl BloomFilter {
     /// Double hashing: derive two independent 64-bit hashes from the key.
     /// We use FNV-1a for h1 and a shifted variant for h2.
     fn hash_pair(&self, key: &[u8]) -> (u64, u64) {
-        // FNV-1a 64-bit
-        let mut h1: u64 = 0xcbf29ce484222325;
-        for &b in key {
-            h1 ^= b as u64;
-            h1 = h1.wrapping_mul(0x100000001b3);
+        // MurmurHash3 64-bit finalizer mix for h1
+        let mut h1: u64 = 0x9368_6449_c81a_1c27;
+        for chunk in key.chunks(8) {
+            let mut k = 0u64;
+            for (i, &b) in chunk.iter().enumerate() {
+                k |= (b as u64) << (i * 8);
+            }
+            k = k.wrapping_mul(0x87c3_7b91_1142_53d5);
+            k = k.rotate_left(31);
+            k = k.wrapping_mul(0x4cf5_ad43_2745_937f);
+            h1 ^= k;
+            h1 = h1.rotate_left(27);
+            h1 = h1.wrapping_mul(5).wrapping_add(0x52dc_e729);
         }
-
-        // Second hash: FNV with a different offset prime
-        let mut h2: u64 = 0x9e3779b97f4a7c15;
+        // finalizer
+        h1 ^= key.len() as u64;
+        h1 ^= h1 >> 33;
+        h1 = h1.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        h1 ^= h1 >> 33;
+        h1 = h1.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        h1 ^= h1 >> 33;
+    
+        // SipHash-inspired mix for h2 — independent from h1
+        let mut h2: u64 = 0x1234_5678_9abc_def0;
         for &b in key {
             h2 ^= b as u64;
-            h2 = h2.wrapping_mul(0x517cc1b727220a95);
+            h2 = h2.wrapping_mul(0x6c62_272e_07bb_0142);
+            h2 ^= h2 >> 31;
+            h2 = h2.wrapping_add(h2 << 13);
         }
-
+        h2 ^= key.len() as u64;
+        h2 ^= h2 >> 28;
+        h2 = h2.wrapping_mul(0x9468_68a0_74f6_3dbb);
+        h2 ^= h2 >> 28;
+    
         (h1, h2)
     }
 
@@ -149,5 +170,55 @@ impl BloomFilter {
         let byte = (pos / 8) as usize;
         let bit = pos % 8;
         (self.bits[byte] >> bit) & 1 == 1
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bloom_fpr_matches_theory() {
+        // (n, target_fpr, tolerance)
+        // Tolerance = ~3 standard errors at the given probe count.
+        // SE = sqrt(p*(1-p)/probes). At p=0.10, probes=100k: SE ≈ 0.00095 → 3SE ≈ 0.003
+        // At p=0.01, probes=100k: SE ≈ 0.00031 → 3SE ≈ 0.001
+        let configs: &[(usize, f64, f64)] = &[
+            (1_000,  0.10,  0.004),  // 10% target, 3SE slack
+            (1_000,  0.05,  0.003),  // 5% target
+            (1_000,  0.01,  0.002),  // 1% target
+            (5_000,  0.01,  0.002),
+            (10_000, 0.001, 0.001),
+        ];
+
+        for &(n, target_fpr, tolerance) in configs {
+            let mut bloom = BloomFilter::new(n, target_fpr);
+
+            for i in 0..n {
+                bloom.insert(format!("inserted_{}", i).as_bytes());
+            }
+
+            // Zero false negatives — every inserted key must be found
+            for i in 0..n {
+                assert!(
+                    bloom.might_contain(format!("inserted_{}", i).as_bytes()),
+                    "False negative at n={} fpr={} i={}",
+                    n, target_fpr, i
+                );
+            }
+
+            // Large probe count to reduce variance
+            let probes = 100_000usize;
+            let false_positives: usize = (0..probes)
+                .filter(|i| bloom.might_contain(format!("absent_{}", i).as_bytes()))
+                .count();
+
+            let measured_fpr = false_positives as f64 / probes as f64;
+
+            assert!(
+                measured_fpr < target_fpr + tolerance,
+                "FPR out of bounds: n={} target={:.3} measured={:.4} tolerance={:.3} (diff={:.4})",
+                n, target_fpr, measured_fpr, tolerance, measured_fpr - target_fpr
+            );
+        }
     }
 }
