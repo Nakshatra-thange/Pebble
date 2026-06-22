@@ -2,6 +2,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+use crate::engine::bloom::BloomFilter;
 use crate::engine::error::EngineError;
 use crate::engine::format::{
     decode_u32, decode_u64, encode_index_entry, encode_sstable_record, encode_u64, OP_DELETE,
@@ -9,24 +10,25 @@ use crate::engine::format::{
 };
 use crate::engine::memtable::MemValue;
 
-/// One entry from a sparse index — a key and the file offset of its record
 #[derive(Debug, Clone)]
 pub struct IndexEntry {
     pub key: Vec<u8>,
     pub offset: u64,
 }
 
-/// A read handle to an SSTable file on disk
 pub struct SSTable {
     pub path: PathBuf,
-    pub index: Vec<IndexEntry>, // sparse index loaded into memory at open
+    pub index: Vec<IndexEntry>,
+    pub bloom: Option<BloomFilter>,
     file: File,
+    key_count: usize,
 }
 
 impl SSTable {
-    /// Flush a sorted list of (key, MemValue) pairs to a new SSTable file.
-    /// Writes: data records → sparse index → footer (index_offset, bloom_offset=0 for now)
-    /// Returns an open SSTable ready for reads.
+    /// Flush sorted entries to a new SSTable file.
+    ///
+    /// File layout:
+    ///   [ data records ][ bloom filter ][ sparse index ][ footer: index_offset(8) + bloom_offset(8) ]
     pub fn flush(
         path: impl AsRef<Path>,
         entries: Vec<(Vec<u8>, MemValue)>,
@@ -38,14 +40,18 @@ impl SSTable {
             .read(true)
             .open(&path)?;
 
+        let key_count = entries.len();
         let mut sparse_index: Vec<IndexEntry> = Vec::new();
         let mut current_offset: u64 = 0;
-
-        // ── Write data records ──────────────────────────────────────────────
-        // Every Nth key gets an index entry (sparse = every 16th key here).
-        // This keeps the index small while still letting us seek close to any key.
         const INDEX_STRIDE: usize = 16;
 
+        // ── Build bloom filter from all keys ────────────────────────────────
+        let mut bloom = BloomFilter::new(key_count, 0.01); // 1% FPR target
+        for (key, _) in &entries {
+            bloom.insert(key);
+        }
+
+        // ── Write data records ───────────────────────────────────────────────
         for (i, (key, mem_val)) in entries.iter().enumerate() {
             if i % INDEX_STRIDE == 0 {
                 sparse_index.push(IndexEntry {
@@ -64,33 +70,38 @@ impl SSTable {
             current_offset += record.len() as u64;
         }
 
-        // ── Write sparse index ──────────────────────────────────────────────
+        // ── Write bloom filter ───────────────────────────────────────────────
+        let bloom_offset = current_offset;
+        let bloom_bytes = bloom.encode();
+        file.write_all(&bloom_bytes)?;
+        current_offset += bloom_bytes.len() as u64;
+
+        // ── Write sparse index ───────────────────────────────────────────────
         let index_offset = current_offset;
         for entry in &sparse_index {
             let encoded = encode_index_entry(&entry.key, entry.offset);
             file.write_all(&encoded)?;
         }
 
-        // ── Write footer (16 bytes) ─────────────────────────────────────────
-        // bloom_offset = 0 for now (Day 5 will fill this in)
+        // ── Write footer ─────────────────────────────────────────────────────
         file.write_all(&encode_u64(index_offset))?;
-        file.write_all(&encode_u64(0u64))?; // bloom placeholder
-
+        file.write_all(&encode_u64(bloom_offset))?;
         file.sync_all()?;
 
         Ok(SSTable {
             path,
             index: sparse_index,
+            bloom: Some(bloom),
             file,
+            key_count,
         })
     }
 
-    /// Open an existing SSTable file and load its sparse index into memory.
+    /// Open an existing SSTable — loads sparse index and bloom filter into memory.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, EngineError> {
         let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new().read(true).open(&path)?;
 
-        // ── Read footer ─────────────────────────────────────────────────────
         let file_len = file.seek(SeekFrom::End(0))?;
         if file_len < 16 {
             return Err(EngineError::Corruption(format!(
@@ -99,13 +110,25 @@ impl SSTable {
             )));
         }
 
+        // ── Read footer ──────────────────────────────────────────────────────
         file.seek(SeekFrom::End(-16))?;
         let mut footer = [0u8; 16];
         file.read_exact(&mut footer)?;
         let index_offset = decode_u64(&footer[0..8]);
-        // bloom_offset = footer[8..16] — used on Day 5
+        let bloom_offset = decode_u64(&footer[8..16]);
 
-        // ── Read sparse index ───────────────────────────────────────────────
+        // ── Load bloom filter ────────────────────────────────────────────────
+        let bloom = if bloom_offset > 0 && bloom_offset < index_offset {
+            file.seek(SeekFrom::Start(bloom_offset))?;
+            let bloom_len = (index_offset - bloom_offset) as usize;
+            let mut bloom_buf = vec![0u8; bloom_len];
+            file.read_exact(&mut bloom_buf)?;
+            BloomFilter::decode(&bloom_buf)
+        } else {
+            None
+        };
+
+        // ── Load sparse index ────────────────────────────────────────────────
         file.seek(SeekFrom::Start(index_offset))?;
         let index_end = file_len - 16;
         let index_bytes = (index_end - index_offset) as usize;
@@ -115,7 +138,6 @@ impl SSTable {
 
         let mut sparse_index: Vec<IndexEntry> = Vec::new();
         let mut cursor = 0usize;
-
         while cursor + 4 <= index_buf.len() {
             let key_len = decode_u32(&index_buf[cursor..]) as usize;
             cursor += 4;
@@ -132,17 +154,25 @@ impl SSTable {
         Ok(SSTable {
             path,
             index: sparse_index,
+            bloom,
             file,
+            key_count: 0, // unknown when reopening; bloom tracks what matters
         })
     }
 
-    /// Look up a key. Returns Some(MemValue) if found, None if not present.
-    /// Uses the sparse index to seek close, then scans forward linearly.
+    /// Point lookup — checks bloom filter before doing any disk seek.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<MemValue>, EngineError> {
-        // Find the last index entry whose key <= target key
-        let seek_offset = self.index_seek(key);
+        // ── Bloom filter check ───────────────────────────────────────────────
+        // If the filter says "definitely not here", skip this SSTable entirely.
+        // Zero disk seeks for misses — this is the whole point.
+        if let Some(ref bloom) = self.bloom {
+            if !bloom.might_contain(key) {
+                return Ok(None); // definite miss — no disk I/O
+            }
+        }
 
-        // Read the index_offset from footer to know where data ends
+        // Bloom said "maybe" — do the actual seek
+        let seek_offset = self.index_seek(key);
         let file_len = self.file.seek(SeekFrom::End(0))?;
         let data_end = self.data_end_offset(file_len)?;
 
@@ -166,8 +196,6 @@ impl SSTable {
                     MemValue::Tombstone
                 }));
             }
-
-            // Keys are sorted — if we've passed the target, it's not here
             if rec_key.as_slice() > key {
                 break;
             }
@@ -176,8 +204,7 @@ impl SSTable {
         Ok(None)
     }
 
-    /// Range scan — returns all entries with key in [start, end).
-    /// Caller merges results from multiple SSTables.
+    /// Range scan — bloom filter not applied here (ranges touch many keys)
     pub fn scan(
         &mut self,
         start: &[u8],
@@ -204,7 +231,6 @@ impl SSTable {
             if rec_key.as_slice() >= end {
                 break;
             }
-
             if rec_key.as_slice() >= start {
                 let val = if op == OP_PUT {
                     MemValue::Value(rec_val)
@@ -218,11 +244,24 @@ impl SSTable {
         Ok(results)
     }
 
-    // ── Internal helpers ────────────────────────────────────────────────────
+    pub fn file_size(&self) -> u64 {
+        std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
+    }
 
-    /// Find the file offset to seek to when looking for `key`.
-    /// Returns the offset of the last index entry whose key <= target,
-    /// or 0 if target is before the first index entry.
+    pub fn bloom_info(&self) -> Option<(u64, u8)> {
+        self.bloom
+            .as_ref()
+            .map(|b| (b.num_bits(), b.num_hash_fns()))
+    }
+
+    pub fn expected_fpr(&self) -> Option<f64> {
+        self.bloom
+            .as_ref()
+            .map(|b| b.expected_fpr(self.key_count))
+    }
+
+    // ── Internal helpers ─────────────────────────────────────────────────────
+
     fn index_seek(&self, key: &[u8]) -> u64 {
         let mut best_offset = 0u64;
         for entry in &self.index {
@@ -235,21 +274,19 @@ impl SSTable {
         best_offset
     }
 
-    /// Returns the byte offset where the data section ends (= index_offset).
     fn data_end_offset(&mut self, file_len: u64) -> Result<u64, EngineError> {
         if file_len < 16 {
             return Err(EngineError::Corruption("SSTable too small".into()));
         }
+        // bloom_offset is the end of data (bloom starts right after data)
         self.file.seek(SeekFrom::End(-16))?;
-        let mut footer = [0u8; 8];
+        let mut footer = [0u8; 16];
         self.file.read_exact(&mut footer)?;
-        Ok(decode_u64(&footer))
+        Ok(decode_u64(&footer[8..16])) // bloom_offset = data end
     }
 
-    /// Read one record from the current file cursor.
-    /// Returns (key, value, op, bytes_consumed) or None at EOF/corrupt.
     fn read_one_record(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>, u8, usize)>, EngineError> {
-        let mut header = [0u8; 9]; // key_len(4) + val_len(4) + op(1)
+        let mut header = [0u8; 9];
         match self.file.read_exact(&mut header) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
@@ -267,13 +304,6 @@ impl SSTable {
             self.file.read_exact(&mut val)?;
         }
 
-        let consumed = 9 + key_len + val_len;
-        Ok(Some((key, val, op, consumed)))
-    }
-
-    pub fn file_size(&self) -> u64 {
-        std::fs::metadata(&self.path)
-            .map(|m| m.len())
-            .unwrap_or(0)
+        Ok(Some((key, val, op, 9 + key_len + val_len)))
     }
 }

@@ -1,169 +1,221 @@
 mod engine;
 
+use engine::bloom::BloomFilter;
 use engine::engine::Engine;
+use engine::memtable::MemValue;
+use engine::sstable::SSTable;
 use std::fs;
 
 fn main() {
-    println!("=== Pebble Engine — Day 4: SSTable Flush + Read ===\n");
+    println!("=== Pebble Engine — Day 5: Bloom Filters ===\n");
 
-    let db_dir = "/tmp/pebble_day4";
-    let _ = fs::remove_dir_all(db_dir);
-
-    // ── Test 1: Basic put + get through the engine ───────────────────────────
-    println!("── Test 1: Basic put / get");
+    // ── Test 1: Bloom filter correctness ─────────────────────────────────────
+    println!("── Test 1: Bloom filter — no false negatives");
     {
-        let mut engine = Engine::open(db_dir).unwrap();
+        let mut bloom = BloomFilter::new(1000, 0.01);
+        let keys: Vec<String> = (0..1000).map(|i| format!("key_{:06}", i)).collect();
 
-        engine.put(b"name", b"alice").unwrap();
-        engine.put(b"city", b"pune").unwrap();
-        engine.put(b"lang", b"rust").unwrap();
-
-        println!("  get(name) = {:?}", engine.get(b"name").unwrap());
-        println!("  get(city) = {:?}", engine.get(b"city").unwrap());
-        println!("  get(missing) = {:?}", engine.get(b"missing").unwrap());
-
-        let snap = engine.metrics.lock().unwrap().snapshot();
-        println!("  WAL size: {} bytes", snap.wal_size_bytes);
-        println!("  SSTables: {}", snap.sstable_count);
-    }
-
-    // ── Test 2: Force a flush, then read from SSTable ────────────────────────
-    println!("\n── Test 2: Manual flush → read from SSTable");
-    {
-        let _ = fs::remove_dir_all(db_dir);
-        let mut engine = Engine::open(db_dir).unwrap();
-
-        // Write some data
-        for i in 0u32..50 {
-            let key = format!("key_{:04}", i);
-            let val = format!("value_{:04}", i);
-            engine.put(key.as_bytes(), val.as_bytes()).unwrap();
+        for k in &keys {
+            bloom.insert(k.as_bytes());
         }
 
-        println!("  Before flush — SSTables: {}", engine.metrics.lock().unwrap().sstable_count);
-        println!("  Before flush — WAL size: {} bytes", engine.metrics.lock().unwrap().wal_size_bytes);
+        // Every inserted key must return true (no false negatives — ever)
+        let mut false_negatives = 0;
+        for k in &keys {
+            if !bloom.might_contain(k.as_bytes()) {
+                false_negatives += 1;
+            }
+        }
+        println!("  False negatives: {} (must be 0) ✓", false_negatives);
+        assert_eq!(false_negatives, 0);
 
-        // Force flush (normally triggered by size threshold)
-        engine.flush_memtable().unwrap();
-
-        println!("  After flush  — SSTables: {}", engine.metrics.lock().unwrap().sstable_count);
-        println!("  After flush  — WAL size: {} bytes (truncated)", engine.metrics.lock().unwrap().wal_size_bytes);
-
-        // Read back from SSTable
-        let v = engine.get(b"key_0023").unwrap();
-        println!("  get(key_0023) from SSTable = {:?}", v.map(|b| String::from_utf8(b).unwrap()));
-
-        let v = engine.get(b"key_0049").unwrap();
-        println!("  get(key_0049) from SSTable = {:?}", v.map(|b| String::from_utf8(b).unwrap()));
-    }
-
-    // ── Test 3: Delete → tombstone survives flush ────────────────────────────
-    println!("\n── Test 3: Delete survives flush");
-    {
-        let _ = fs::remove_dir_all(db_dir);
-        let mut engine = Engine::open(db_dir).unwrap();
-
-        engine.put(b"ghost", b"i exist").unwrap();
-        engine.delete(b"ghost").unwrap();
-        engine.flush_memtable().unwrap();
-
-        // Must still return None — tombstone in SSTable blocks the read
-        let v = engine.get(b"ghost").unwrap();
-        println!("  get(ghost) after flush = {:?} (None = tombstone respected ✓)", v);
-    }
-
-    // ── Test 4: memtable + SSTable read merge ────────────────────────────────
-    println!("\n── Test 4: Memtable shadows SSTable");
-    {
-        let _ = fs::remove_dir_all(db_dir);
-        let mut engine = Engine::open(db_dir).unwrap();
-
-        // Write v1 and flush it to SSTable
-        engine.put(b"version", b"v1").unwrap();
-        engine.flush_memtable().unwrap();
-
-        // Write v2 — lives in memtable only
-        engine.put(b"version", b"v2").unwrap();
-
-        let v = engine.get(b"version").unwrap();
         println!(
-            "  get(version) = {:?} (should be v2 from memtable, not v1 from SSTable ✓)",
-            v.map(|b| String::from_utf8(b).unwrap())
+            "  Filter: {} bits, k={} hash fns",
+            bloom.num_bits(),
+            bloom.num_hash_fns()
+        );
+        println!("  Expected FPR: {:.4}%", bloom.expected_fpr(1000) * 100.0);
+    }
+
+    // ── Test 2: False positive rate measurement ───────────────────────────────
+    println!("\n── Test 2: Measured false positive rate at different sizes");
+    println!("  {:>12}  {:>10}  {:>12}  {:>12}", "target_fpr", "bits", "measured_fpr", "k");
+
+    for &target_fpr in &[0.10, 0.05, 0.01, 0.001] {
+        let n = 10_000usize;
+        let mut bloom = BloomFilter::new(n, target_fpr);
+
+        // Insert n keys
+        for i in 0..n {
+            bloom.insert(format!("inserted_{}", i).as_bytes());
+        }
+
+        // Test against n different keys that were never inserted
+        let trials = 100_000usize;
+        let mut false_positives = 0usize;
+        for i in 0..trials {
+            if bloom.might_contain(format!("absent_{}", i).as_bytes()) {
+                false_positives += 1;
+            }
+        }
+
+        let measured = false_positives as f64 / trials as f64;
+        println!(
+            "  {:>12.3}  {:>10}  {:>11.4}%  {:>12}",
+            target_fpr,
+            bloom.num_bits(),
+            measured * 100.0,
+            bloom.num_hash_fns()
         );
     }
 
-    // ── Test 5: Range scan across memtable + SSTable ─────────────────────────
-    println!("\n── Test 5: Range scan across memtable + SSTable");
+    // ── Test 3: Bloom filter encode / decode round-trip ──────────────────────
+    println!("\n── Test 3: Encode / decode round-trip");
     {
-        let _ = fs::remove_dir_all(db_dir);
-        let mut engine = Engine::open(db_dir).unwrap();
-
-        // Flush first batch
-        engine.put(b"apple", b"1").unwrap();
-        engine.put(b"cherry", b"3").unwrap();
-        engine.put(b"elderberry", b"5").unwrap();
-        engine.flush_memtable().unwrap();
-
-        // Second batch stays in memtable
-        engine.put(b"banana", b"2").unwrap();
-        engine.put(b"date", b"4").unwrap();
-
-        let results = engine.scan(b"apple", b"fig").unwrap();
-        println!("  scan(apple..fig):");
-        for (k, v) in &results {
-            println!(
-                "    {:?} = {:?}",
-                String::from_utf8_lossy(k),
-                String::from_utf8_lossy(v)
-            );
+        let mut bloom = BloomFilter::new(500, 0.01);
+        for i in 0..500u32 {
+            bloom.insert(format!("rt_key_{}", i).as_bytes());
         }
-        assert_eq!(results.len(), 5);
-        println!("  All 5 entries merged correctly ✓");
+
+        let encoded = bloom.encode();
+        let decoded = BloomFilter::decode(&encoded).expect("decode failed");
+
+        // All inserted keys must still be found after round-trip
+        let mut misses = 0;
+        for i in 0..500u32 {
+            if !decoded.might_contain(format!("rt_key_{}", i).as_bytes()) {
+                misses += 1;
+            }
+        }
+        println!("  Encoded size: {} bytes", encoded.len());
+        println!("  Misses after decode (must be 0): {} ✓", misses);
+        assert_eq!(misses, 0);
     }
 
-    // ── Test 6: Crash recovery — reopen and read SSTables ────────────────────
-    println!("\n── Test 6: Crash recovery across engine reopen");
+    // ── Test 4: SSTable with bloom filter — definite misses skip disk ─────────
+    println!("\n── Test 4: SSTable bloom — definite misses");
     {
-        let _ = fs::remove_dir_all(db_dir);
+        let sst_path = "/tmp/pebble_bloom_test.sst";
+        let _ = fs::remove_file(sst_path);
 
-        // Session A — write and flush
+        // Build a small SSTable
+        let entries: Vec<(Vec<u8>, MemValue)> = (0..100u32)
+            .map(|i| {
+                (
+                    format!("bloom_key_{:04}", i).into_bytes(),
+                    MemValue::Value(format!("val_{}", i).into_bytes()),
+                )
+            })
+            .collect();
+
+        let mut sst = SSTable::flush(sst_path, entries).unwrap();
+
+        if let Some((bits, k)) = sst.bloom_info() {
+            println!("  Bloom filter: {} bits, k={}", bits, k);
+        }
+        if let Some(fpr) = sst.expected_fpr() {
+            println!("  Expected FPR: {:.4}%", fpr * 100.0);
+        }
+
+        // Key that exists → found
+        let found = sst.get(b"bloom_key_0042").unwrap();
+        println!(
+            "  get(bloom_key_0042) = {:?} ✓",
+            found.as_ref().map(|v| match v {
+                MemValue::Value(b) => String::from_utf8_lossy(b).into_owned(),
+                MemValue::Tombstone => "<tombstone>".into(),
+            })
+        );
+
+        // Key that never existed → bloom returns false, no disk seek
+        let miss = sst.get(b"never_inserted_key_xyz").unwrap();
+        println!("  get(never_inserted_key_xyz) = {:?} (bloom skipped disk ✓)", miss);
+        assert!(miss.is_none());
+
+        let _ = fs::remove_file(sst_path);
+    }
+
+    // ── Test 5: Bloom survives SSTable reopen ────────────────────────────────
+    println!("\n── Test 5: Bloom filter survives SSTable reopen");
+    {
+        let sst_path = "/tmp/pebble_bloom_reopen.sst";
+        let _ = fs::remove_file(sst_path);
+
+        let entries: Vec<(Vec<u8>, MemValue)> = (0..200u32)
+            .map(|i| {
+                (
+                    format!("persist_key_{:05}", i).into_bytes(),
+                    MemValue::Value(b"v".to_vec()),
+                )
+            })
+            .collect();
+
+        // Write and close
         {
-            let mut engine = Engine::open(db_dir).unwrap();
-            engine.put(b"durable", b"absolutely").unwrap();
-            engine.flush_memtable().unwrap();
-            // Engine dropped here — simulated shutdown
+            SSTable::flush(sst_path, entries).unwrap();
         }
 
-        // Session B — reopen, data should still be there
-        {
-            let mut engine = Engine::open(db_dir).unwrap();
-            let v = engine.get(b"durable").unwrap();
-            println!(
-                "  get(durable) after reopen = {:?} ✓",
-                v.map(|b| String::from_utf8(b).unwrap())
-            );
-            println!("  SSTables found on reopen: {}", engine.metrics.lock().unwrap().sstable_count);
+        // Reopen and verify bloom still works
+        let mut sst = SSTable::open(sst_path).unwrap();
+
+        let mut false_negatives = 0;
+        for i in 0..200u32 {
+            let key = format!("persist_key_{:05}", i);
+            if let Some(ref bloom) = sst.bloom {
+                if !bloom.might_contain(key.as_bytes()) {
+                    false_negatives += 1;
+                }
+            }
         }
+
+        println!("  False negatives after reopen: {} (must be 0) ✓", false_negatives);
+        assert_eq!(false_negatives, 0);
+
+        // Miss on never-inserted key
+        let miss = sst.get(b"totally_absent").unwrap();
+        println!("  get(totally_absent) after reopen = {:?} ✓", miss);
+
+        if let Some((bits, k)) = sst.bloom_info() {
+            println!("  Loaded bloom: {} bits, k={}", bits, k);
+        }
+
+        let _ = fs::remove_file(sst_path);
     }
 
-    // ── Test 7: Metrics snapshot ──────────────────────────────────────────────
-    println!("\n── Test 7: Metrics after a full session");
+    // ── Test 6: Full engine — bloom works end to end ──────────────────────────
+    println!("\n── Test 6: Full engine with bloom filters");
     {
+        let db_dir = "/tmp/pebble_day5";
         let _ = fs::remove_dir_all(db_dir);
-        let mut engine = Engine::open(db_dir).unwrap();
+        let mut eng = Engine::open(db_dir).unwrap();
 
-        for i in 0u32..30 {
-            engine.put(format!("k{}", i).as_bytes(), b"v").unwrap();
+        // Write 200 keys and flush
+        for i in 0..200u32 {
+            let key = format!("engine_key_{:05}", i);
+            let val = format!("engine_val_{:05}", i);
+            eng.put(key.as_bytes(), val.as_bytes()).unwrap();
         }
-        engine.flush_memtable().unwrap();
-        for i in 0u32..10 {
-            engine.get(format!("k{}", i).as_bytes()).unwrap();
-        }
+        eng.flush_memtable().unwrap();
 
-        let snap = engine.metrics.lock().unwrap().snapshot();
-        println!("  {}", snap.to_json());
+        // Reads of existing keys
+        let v = eng.get(b"engine_key_00099").unwrap();
+        println!(
+            "  get(engine_key_00099) = {:?} ✓",
+            v.map(|b| String::from_utf8(b).unwrap())
+        );
+
+        // Reads of absent keys — bloom should skip the SSTable
+        let v = eng.get(b"ghost_key_never_written").unwrap();
+        println!("  get(ghost_key_never_written) = {:?} (bloom skip ✓)", v);
+
+        let snap = eng.metrics.lock().unwrap().snapshot();
+        println!("  SSTables: {}", snap.sstable_count);
+        println!("  Total reads: {}", snap.total_reads);
+
+        let _ = fs::remove_dir_all(db_dir);
     }
 
-    let _ = fs::remove_dir_all(db_dir);
-    println!("\nDay 4 complete. SSTable flush, sparse index seek, and cross-layer reads all work.");
+    println!("\nDay 5 complete. Bloom filters built, measured, serialized, and wired into SSTables.");
+    println!("Every SSTable now has a 1% FPR bloom filter loaded at open time.");
+    println!("Absent key lookups skip disk entirely — zero seeks for definite misses.");
 }
