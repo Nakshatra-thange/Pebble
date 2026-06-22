@@ -219,6 +219,9 @@ pebble_dashboard.html  standalone web dashboard, polls /metrics every 2s
 
 External dependencies: `crc32fast` (checksum computation), `tiny_http` (metrics server). Everything else — the binary format, hash functions, data structures, and merge logic — is implemented from scratch.
 
+![Pebble dashboard](dashboard.png)
+
+
 ---
 
 ## What was deliberately left out
