@@ -1,6 +1,10 @@
 mod engine;
 
 use engine::engine::Engine;
+use engine::memtable::MemValue;
+use engine::metrics::new_shared_metrics;
+use engine::sstable::SSTable;
+use engine::wal::Wal;
 use std::fs;
 use std::time::Instant;
 
@@ -151,8 +155,7 @@ fn main() {
         let db_dir = "/tmp/pebble_kill9_a";
         let _ = fs::remove_dir_all(db_dir);
 
-        use engine::wal::Wal;
-        use engine::metrics::new_shared_metrics;
+        
 
         // Write 3 records, then corrupt the 3rd by truncating mid-record
         {
@@ -190,9 +193,7 @@ fn main() {
         // Manually set up: SSTable on disk AND WAL with same data (flush completed
         // but engine crashed before WAL truncation)
         {
-            use engine::metrics::new_shared_metrics;
-            use engine::memtable::MemValue;
-            use engine::wal::Wal;
+            
 
             fs::create_dir_all(db_dir).unwrap();
             let metrics = new_shared_metrics();
@@ -230,7 +231,7 @@ fn main() {
         let _ = fs::remove_dir_all(db_dir);
 
         {
-            use engine::memtable::MemValue;
+            
 
             fs::create_dir_all(db_dir).unwrap();
 
@@ -255,7 +256,7 @@ fn main() {
             // Compacted output (process died before deleting 001 and 002)
             SSTable::flush(format!("{}/sst_00000003.sst", db_dir), entries_merged).unwrap();
             // WAL is empty (flush was done)
-            use engine::metrics::new_shared_metrics;
+            
             let metrics = new_shared_metrics();
             Wal::open(format!("{}/wal.log", db_dir), metrics).unwrap();
         }

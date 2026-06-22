@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use crate::engine::error::EngineError;
 use crate::engine::metrics::SharedMetrics;
 
 /// A value stored in the memtable — either a live value or a tombstone (delete marker)

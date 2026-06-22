@@ -41,11 +41,11 @@ pub fn compact(
     use std::collections::BTreeMap;
     let mut merged: BTreeMap<Vec<u8>, MemValue> = BTreeMap::new();
 
+    // Process oldest → newest so newer values overwrite older ones
     for sst in sstables[start_idx..].iter_mut().rev() {
-        // scan entire SSTable (start = empty, end = max possible key)
         let all_entries = sst.scan(b"", b"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF")?;
         for (key, val) in all_entries {
-            merged.entry(key).or_insert(val);
+            merged.insert(key, val); // insert always overwrites — newest wins
         }
     }
 
