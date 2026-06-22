@@ -5,3 +5,4 @@ pub mod wal;
 pub mod memtable;
 pub mod sstable;
 pub mod engine;
+pub mod bloom;
