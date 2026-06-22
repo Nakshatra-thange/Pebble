@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pebble Engine Dashboard</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#F5F4F0;color:#2C2C2A;min-height:100vh;padding:24px}
+  .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}
+  .logo{display:flex;align-items:center;gap:10px;font-size:18px;font-weight:500}
+  .logo-dot{width:28px;height:28px;border-radius:8px;background:#E8A020;display:flex;align-items:center;justify-content:center;color:#fff;font-size:14px}
+  .live-badge{background:#FEF3DC;color:#9A5F0A;font-size:12px;padding:4px 12px;border-radius:20px}
+  .metrics-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+  .card{background:#fff;border-radius:14px;border:0.5px solid rgba(0,0,0,0.08);padding:16px 18px}
+  .card-label{font-size:12px;color:#888780;margin-bottom:6px}
+  .card-value{font-size:24px;font-weight:500;color:#2C2C2A}
+  .card-value.accent{color:#D07A14}
+  .card-sub{font-size:11px;color:#B4B2A9;margin-top:3px}
+  .charts-row{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:20px}
+  .chart-card{background:#fff;border-radius:14px;border:0.5px solid rgba(0,0,0,0.08);padding:16px 18px}
+  .chart-title{font-size:13px;font-weight:500;margin-bottom:12px;color:#2C2C2A}
+  canvas{display:block}
+  .bench{background:#fff;border-radius:14px;border:0.5px solid rgba(0,0,0,0.08);padding:16px 18px}
+  .bench-row{display:flex;align-items:center;gap:12px;margin-bottom:10px}
+  .bench-label{font-size:12px;color:#888780;width:140px;flex-shrink:0}
+  .bench-track{flex:1;height:8px;background:#F1EFE8;border-radius:4px;overflow:hidden}
+  .bench-fill{height:100%;border-radius:4px}
+  .bench-val{font-size:12px;font-weight:500;color:#444441;min-width:50px;text-align:right}
+  .fpr-note{font-size:11px;color:#B4B2A9;margin-top:10px;padding-top:10px;border-top:0.5px solid #F1EFE8}
+  .bottom-row{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="logo">
+    <div class="logo-dot">🪨</div>
+    Pebble Engine
+  </div>
+  <div class="live-badge">● Live · polling /metrics every 1s</div>
+</div>
+
+<div class="metrics-row">
+  <div class="card"><div class="card-label">Writes / sec</div><div class="card-value accent" id="wps">—</div><div class="card-sub" id="total-writes">total: —</div></div>
+  <div class="card"><div class="card-label">Reads / sec</div><div class="card-value" id="rps">—</div><div class="card-sub" id="total-reads">total: —</div></div>
+  <div class="card"><div class="card-label">SSTables</div><div class="card-value" id="sst">—</div><div class="card-sub" id="compact">compactions: —</div></div>
+  <div class="card"><div class="card-label">WAL size</div><div class="card-value" id="wal">—</div><div class="card-sub" id="recovery">recovery: —</div></div>
+</div>
+
+<div class="charts-row">
+  <div class="chart-card">
+    <div class="chart-title">Throughput · last 30s</div>
+    <canvas id="tChart" height="140"></canvas>
+  </div>
+  <div class="chart-card">
+    <div class="chart-title">SSTable count · history</div>
+    <canvas id="sChart" height="140"></canvas>
+  </div>
+</div>
+
+<div class="bottom-row">
+  <div class="bench">
+    <div class="chart-title">Benchmark comparison · read latency</div>
+    <div class="bench-row">
+      <span class="bench-label">WAL only</span>
+      <div class="bench-track"><div class="bench-fill" style="width:3%;background:#B4B2A9"></div></div>
+      <span class="bench-val">0.8 µs</span>
+    </div>
+    <div class="bench-row">
+      <span class="bench-label">+ SSTables (no bloom)</span>
+      <div class="bench-track"><div class="bench-fill" style="width:100%;background:#E8A020"></div></div>
+      <span class="bench-val">29 µs</span>
+    </div>
+    <div class="bench-row">
+      <span class="bench-label">+ Bloom filters (1%)</span>
+      <div class="bench-track"><div class="bench-fill" style="width:18%;background:#D07A14"></div></div>
+      <span class="bench-val">5.2 µs</span>
+    </div>
+    <div class="fpr-note">9,586 bits · k=7 hash fns · double hashing (Kirsch–Mitzenmacher) · ~9× speedup on absent keys</div>
+  </div>
+
+  <div class="bench">
+    <div class="chart-title">WAL size over time</div>
+    <canvas id="wChart" height="140"></canvas>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+const amber='#E8A020', amberD='#D07A14', gray='#B4B2A9';
+const mk30=()=>Array.from({length:30},(_,i)=>i===29?'now':(29-i)+'s');
+
+const tChart=new Chart(document.getElementById('tChart'),{
+  type:'line',
+  data:{labels:mk30(),datasets:[
+    {label:'writes/sec',data:Array(30).fill(0),borderColor:amber,backgroundColor:'rgba(232,160,32,0.08)',fill:true,tension:0.4,pointRadius:0,borderWidth:2},
+    {label:'reads/sec',data:Array(30).fill(0),borderColor:gray,backgroundColor:'rgba(180,178,169,0.06)',fill:true,tension:0.4,pointRadius:0,borderWidth:1.5,borderDash:[4,3]}
+  ]},
+  options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false},ticks:{font:{size:10},color:gray,maxTicksLimit:6}},y:{grid:{color:'rgba(0,0,0,0.04)'},ticks:{font:{size:10},color:gray},beginAtZero:true}}}
+});
+
+const sChart=new Chart(document.getElementById('sChart'),{
+  type:'bar',
+  data:{labels:Array.from({length:20},(_,i)=>'t'+(i+1)),datasets:[{label:'SSTables',data:Array(20).fill(0),backgroundColor:amber,borderRadius:4,borderSkipped:false}]},
+  options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false},ticks:{font:{size:10},color:gray}},y:{grid:{color:'rgba(0,0,0,0.04)'},ticks:{font:{size:10},color:gray,stepSize:1},beginAtZero:true,max:6}}}
+});
+
+const wChart=new Chart(document.getElementById('wChart'),{
+  type:'line',
+  data:{labels:mk30(),datasets:[{label:'WAL bytes',data:Array(30).fill(0),borderColor:amberD,backgroundColor:'rgba(208,122,20,0.07)',fill:true,tension:0.4,pointRadius:0,borderWidth:2}]},
+  options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{grid:{display:false},ticks:{font:{size:10},color:gray,maxTicksLimit:6}},y:{grid:{color:'rgba(0,0,0,0.04)'},ticks:{font:{size:10},color:gray,callback:v=>v>1024?(v/1024).toFixed(0)+'K':v},beginAtZero:true}}}
+});
+
+function fmtBytes(b){if(b===0)return'0 B';if(b<1024)return b+' B';return(b/1024).toFixed(1)+' KB'}
+
+let prev={writes:0,reads:0};
+
+async function poll(){
+  try{
+    const r=await fetch('http://localhost:7777/metrics');
+    const d=await r.json();
+
+    const wps=Math.max(0,d.total_writes-prev.writes);
+    const rps=Math.max(0,d.total_reads-prev.reads);
+    prev={writes:d.total_writes,reads:d.total_reads};
+
+    document.getElementById('wps').textContent=wps.toLocaleString();
+    document.getElementById('total-writes').textContent='total: '+d.total_writes.toLocaleString();
+    document.getElementById('rps').textContent=rps.toLocaleString();
+    document.getElementById('total-reads').textContent='total: '+d.total_reads.toLocaleString();
+    document.getElementById('sst').textContent=d.sstable_count;
+    document.getElementById('compact').textContent='compactions: '+d.compaction_count;
+    document.getElementById('wal').textContent=fmtBytes(d.wal_size_bytes);
+    document.getElementById('recovery').textContent='recovery: '+d.recovery_time_ms+'ms';
+
+    tChart.data.datasets[0].data.push(wps); tChart.data.datasets[0].data.shift();
+    tChart.data.datasets[1].data.push(rps); tChart.data.datasets[1].data.shift();
+    tChart.update('none');
+
+    sChart.data.datasets[0].data.push(d.sstable_count); sChart.data.datasets[0].data.shift();
+    sChart.data.datasets[0].backgroundColor=sChart.data.datasets[0].data.map(v=>v<=1?'#FEF3DC':amber);
+    sChart.update('none');
+
+    wChart.data.datasets[0].data.push(d.wal_size_bytes); wChart.data.datasets[0].data.shift();
+    wChart.update('none');
+  }catch(e){
+    document.getElementById('wps').textContent='—';
+  }
+}
+
+poll();
+setInterval(poll,1000);
+</script>
+</body>
+</html>

@@ -9,3 +9,4 @@ path = "src/main.rs"
 
 [dependencies]
 crc32fast = "1.4"
+tiny_http = "0.12"
